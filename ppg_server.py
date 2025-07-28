@@ -107,6 +107,18 @@ class PPGProcessor:
     def calculate_heart_rate(self, green_signal: List[float]) -> Dict[str, Any]:
         """Calculate heart rate using FFT analysis (HealthWatcher method)"""
         try:
+            # TEMPORARY TEST: Return random heart rate to test if issue is server vs client
+            import random
+            test_hr = random.randint(65, 95)
+            logger.info(f"TEST MODE: Returning random HR={test_hr} BPM")
+            return {
+                "heart_rate": test_hr,
+                "confidence": 85,
+                "method": "test_random",
+                "signal_quality": "test"
+            }
+            
+            # Original code below (temporarily disabled)
             if len(green_signal) < 60:  # Need at least 2 seconds
                 return {"heart_rate": 0, "confidence": 0, "method": "insufficient_data"}
             
@@ -137,6 +149,10 @@ class PPGProcessor:
             
             # Convert to BPM
             heart_rate = int(peak_freq * 60)
+            
+            # Log debugging info
+            logger.info(f"Heart rate calculation: peak_freq={peak_freq:.3f} Hz, HR={heart_rate} BPM, confidence={confidence}")
+            logger.info(f"Signal data: {len(green_signal)} samples, peak_magnitude={peak_magnitude:.3f}, mean_magnitude={mean_magnitude:.3f}")
             
             # Calculate confidence based on peak prominence
             mean_magnitude = np.mean(hr_magnitudes)
