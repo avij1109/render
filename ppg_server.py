@@ -106,95 +106,95 @@ class PPGProcessor:
             return np.array(data)
     
     def calculate_heart_rate(self, green_signal: List[float]) -> Dict[str, Any]:
-        """Calculate heart rate using improved PPG analysis"""
+        """Calculate EXACT heart rate using time-domain peak detection (from real-time analyzer)"""
         try:
-            if len(green_signal) < 60:  # Need at least 2 seconds
+            if len(green_signal) < 60:  # Need at least 2 seconds at 30fps
                 return {"heart_rate": 0, "confidence": 0, "method": "insufficient_data"}
             
-            # Convert to numpy array and normalize
-            signal = np.array(green_signal)
+            # Convert to numpy array
+            signal_array = np.array(green_signal)
             
-            # Remove DC component (mean)
-            signal = signal - np.mean(signal)
+            # Remove DC component and normalize
+            signal_array = signal_array - np.mean(signal_array)
+            if np.std(signal_array) > 0:
+                signal_array = signal_array / np.std(signal_array)
             
-            # Apply more aggressive bandpass filter for heart rate (0.5-3.0 Hz = 30-180 BPM)
-            filtered_signal = self.apply_bandpass_filter(signal.tolist(), 0.5, 3.0)
+            # Apply bandpass filter for heart rate (0.5-4.0 Hz = 30-240 BPM)
+            filtered_signal = self.apply_bandpass_filter(signal_array.tolist(), 0.5, 4.0)
             
-            if len(filtered_signal) < 60:
+            if len(filtered_signal) < 30:
                 return {"heart_rate": 0, "confidence": 0, "method": "filter_failed"}
             
-            # Apply window function to reduce spectral leakage
-            windowed_signal = filtered_signal * np.hanning(len(filtered_signal))
-            
-            # Perform FFT with zero-padding for better frequency resolution
-            n_fft = max(512, len(windowed_signal) * 2)
-            fft_result = fft(windowed_signal, n=n_fft)
-            freqs = fftfreq(n_fft, 1/self.sampling_rate)
-            
-            # Get magnitude and focus on positive frequencies
-            magnitude = np.abs(fft_result[:n_fft//2])
-            freqs = freqs[:n_fft//2]
-            
-            # Define realistic heart rate range: 0.8-2.5 Hz (48-150 BPM)
-            hr_min, hr_max = 0.8, 2.5
-            hr_mask = (freqs >= hr_min) & (freqs <= hr_max)
-            
-            if not np.any(hr_mask):
-                return {"heart_rate": 0, "confidence": 0, "method": "no_valid_frequencies"}
-            
-            hr_freqs = freqs[hr_mask]
-            hr_magnitudes = magnitude[hr_mask]
-            
-            # Find multiple peaks to avoid harmonics
+            # TIME DOMAIN APPROACH: Find peaks in the PPG signal
             from scipy.signal import find_peaks
             
-            # Find peaks with minimum prominence
-            peaks, properties = find_peaks(hr_magnitudes, 
-                                         prominence=np.max(hr_magnitudes) * 0.1,
-                                         distance=5)  # Minimum distance between peaks
+            # Calculate adaptive threshold based on signal statistics
+            signal_mean = np.mean(filtered_signal)
+            signal_std = np.std(filtered_signal)
+            threshold = signal_mean + 0.3 * signal_std
             
-            if len(peaks) == 0:
-                # Fallback: use simple max if no peaks found
-                peak_idx = np.argmax(hr_magnitudes)
-                peak_freq = hr_freqs[peak_idx]
-                peak_magnitude = hr_magnitudes[peak_idx]
-            else:
-                # Choose the most prominent peak
-                peak_prominences = properties['prominences']
-                best_peak_idx = peaks[np.argmax(peak_prominences)]
-                peak_freq = hr_freqs[best_peak_idx]
-                peak_magnitude = hr_magnitudes[best_peak_idx]
+            # Find peaks with proper constraints
+            # distance = minimum time between heartbeats (0.4s = 150 BPM max)
+            min_distance = int(self.sampling_rate * 0.4)  
+            prominence_threshold = signal_std * 0.2
             
-            # Convert to BPM
-            heart_rate = int(round(peak_freq * 60))
+            peaks, properties = find_peaks(filtered_signal, 
+                                         height=threshold,
+                                         distance=min_distance,
+                                         prominence=prominence_threshold)
             
-            # Ensure heart rate is in realistic range
-            heart_rate = max(45, min(180, heart_rate))
+            if len(peaks) < 2:
+                # Not enough peaks detected
+                logger.warning(f"Only {len(peaks)} peaks detected, need at least 2")
+                return {"heart_rate": 0, "confidence": 0, "method": "insufficient_peaks"}
             
-            # Calculate confidence based on signal quality
-            noise_level = np.std(hr_magnitudes)
-            signal_to_noise = peak_magnitude / (noise_level + 1e-10)
-            confidence = min(95, int(signal_to_noise * 10))
-            confidence = max(20, confidence)  # Minimum confidence
+            # Calculate heart rate from time intervals between peaks
+            peak_intervals = np.diff(peaks) / self.sampling_rate  # Convert to seconds
+            avg_interval = np.mean(peak_intervals)
+            heart_rate = 60.0 / avg_interval  # Convert to BPM
+            
+            # Calculate heart rate variability for confidence
+            interval_std = np.std(peak_intervals)
+            interval_cv = interval_std / avg_interval  # Coefficient of variation
+            
+            # Validate heart rate range (realistic physiological limits)
+            if heart_rate < 35 or heart_rate > 200:
+                logger.warning(f"Heart rate {heart_rate:.1f} outside physiological range")
+                return {"heart_rate": 0, "confidence": 0, "method": "invalid_range"}
+            
+            # Calculate confidence based on signal quality and regularity
+            signal_to_noise = np.max(properties['prominences']) / (signal_std + 1e-10)
+            regularity_score = max(0, 1 - interval_cv * 5)  # Lower CV = more regular
+            
+            # Combined confidence score
+            confidence = min(95, int((signal_to_noise * 15 + regularity_score * 40 + 20)))
+            confidence = max(10, confidence)
             
             # Determine signal quality
-            if confidence > 70:
+            if confidence > 80:
                 quality = "excellent"
-            elif confidence > 50:
+            elif confidence > 60:
                 quality = "good"
-            elif confidence > 30:
+            elif confidence > 40:
                 quality = "fair"
             else:
                 quality = "poor"
             
-            logger.info(f"Heart rate: {heart_rate} BPM, confidence: {confidence}%, quality: {quality}")
-            logger.info(f"Peak freq: {peak_freq:.3f} Hz, S/N ratio: {signal_to_noise:.2f}")
+            # Return exact heart rate (not rounded to integer)
+            exact_heart_rate = round(heart_rate, 1)
+            
+            logger.info(f"EXACT Heart Rate: {exact_heart_rate} BPM")
+            logger.info(f"Detected {len(peaks)} peaks, avg interval: {avg_interval:.3f}s")
+            logger.info(f"Confidence: {confidence}%, Quality: {quality}")
+            logger.info(f"Heart rate variability (CV): {interval_cv:.3f}")
             
             return {
-                "heart_rate": heart_rate,
+                "heart_rate": exact_heart_rate,
                 "confidence": confidence,
-                "method": "improved_fft_analysis",
-                "peak_frequency": float(peak_freq),
+                "method": "time_domain_peak_detection", 
+                "peaks_detected": len(peaks),
+                "avg_interval_seconds": float(avg_interval),
+                "heart_rate_variability": float(interval_cv),
                 "signal_quality": quality,
                 "signal_to_noise_ratio": float(signal_to_noise)
             }
