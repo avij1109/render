@@ -6,6 +6,7 @@ import json
 import numpy as np
 import cv2
 from scipy import signal
+from scipy.signal import find_peaks
 from scipy.fft import fft, fftfreq
 import asyncio
 from typing import List, Dict, Any
@@ -105,65 +106,97 @@ class PPGProcessor:
             return np.array(data)
     
     def calculate_heart_rate(self, green_signal: List[float]) -> Dict[str, Any]:
-        """Calculate heart rate using FFT analysis (HealthWatcher method)"""
+        """Calculate heart rate using improved PPG analysis"""
         try:
-            # TEMPORARY TEST: Return random heart rate to test if issue is server vs client
-            import random
-            test_hr = random.randint(65, 95)
-            logger.info(f"TEST MODE: Returning random HR={test_hr} BPM")
-            return {
-                "heart_rate": test_hr,
-                "confidence": 85,
-                "method": "test_random",
-                "signal_quality": "test"
-            }
-            
-            # Original code below (temporarily disabled)
             if len(green_signal) < 60:  # Need at least 2 seconds
                 return {"heart_rate": 0, "confidence": 0, "method": "insufficient_data"}
             
-            # Apply bandpass filter for heart rate frequency range
-            filtered_signal = self.apply_bandpass_filter(green_signal, 
-                                                       self.hr_freq_range[0], 
-                                                       self.hr_freq_range[1])
+            # Convert to numpy array and normalize
+            signal = np.array(green_signal)
             
-            # Perform FFT
-            fft_result = fft(filtered_signal)
-            freqs = fftfreq(len(filtered_signal), 1/self.sampling_rate)
+            # Remove DC component (mean)
+            signal = signal - np.mean(signal)
             
-            # Get magnitude and find peak in heart rate range
-            magnitude = np.abs(fft_result)
+            # Apply more aggressive bandpass filter for heart rate (0.5-3.0 Hz = 30-180 BPM)
+            filtered_signal = self.apply_bandpass_filter(signal.tolist(), 0.5, 3.0)
             
-            # Find frequencies in heart rate range
-            hr_mask = (freqs >= self.hr_freq_range[0]) & (freqs <= self.hr_freq_range[1])
+            if len(filtered_signal) < 60:
+                return {"heart_rate": 0, "confidence": 0, "method": "filter_failed"}
+            
+            # Apply window function to reduce spectral leakage
+            windowed_signal = filtered_signal * np.hanning(len(filtered_signal))
+            
+            # Perform FFT with zero-padding for better frequency resolution
+            n_fft = max(512, len(windowed_signal) * 2)
+            fft_result = fft(windowed_signal, n=n_fft)
+            freqs = fftfreq(n_fft, 1/self.sampling_rate)
+            
+            # Get magnitude and focus on positive frequencies
+            magnitude = np.abs(fft_result[:n_fft//2])
+            freqs = freqs[:n_fft//2]
+            
+            # Define realistic heart rate range: 0.8-2.5 Hz (48-150 BPM)
+            hr_min, hr_max = 0.8, 2.5
+            hr_mask = (freqs >= hr_min) & (freqs <= hr_max)
+            
             if not np.any(hr_mask):
                 return {"heart_rate": 0, "confidence": 0, "method": "no_valid_frequencies"}
             
             hr_freqs = freqs[hr_mask]
             hr_magnitudes = magnitude[hr_mask]
             
-            # Find peak frequency
-            peak_idx = np.argmax(hr_magnitudes)
-            peak_freq = hr_freqs[peak_idx]
-            peak_magnitude = hr_magnitudes[peak_idx]
+            # Find multiple peaks to avoid harmonics
+            from scipy.signal import find_peaks
+            
+            # Find peaks with minimum prominence
+            peaks, properties = find_peaks(hr_magnitudes, 
+                                         prominence=np.max(hr_magnitudes) * 0.1,
+                                         distance=5)  # Minimum distance between peaks
+            
+            if len(peaks) == 0:
+                # Fallback: use simple max if no peaks found
+                peak_idx = np.argmax(hr_magnitudes)
+                peak_freq = hr_freqs[peak_idx]
+                peak_magnitude = hr_magnitudes[peak_idx]
+            else:
+                # Choose the most prominent peak
+                peak_prominences = properties['prominences']
+                best_peak_idx = peaks[np.argmax(peak_prominences)]
+                peak_freq = hr_freqs[best_peak_idx]
+                peak_magnitude = hr_magnitudes[best_peak_idx]
             
             # Convert to BPM
-            heart_rate = int(peak_freq * 60)
+            heart_rate = int(round(peak_freq * 60))
             
-            # Log debugging info
-            logger.info(f"Heart rate calculation: peak_freq={peak_freq:.3f} Hz, HR={heart_rate} BPM, confidence={confidence}")
-            logger.info(f"Signal data: {len(green_signal)} samples, peak_magnitude={peak_magnitude:.3f}, mean_magnitude={mean_magnitude:.3f}")
+            # Ensure heart rate is in realistic range
+            heart_rate = max(45, min(180, heart_rate))
             
-            # Calculate confidence based on peak prominence
-            mean_magnitude = np.mean(hr_magnitudes)
-            confidence = min(100, int((peak_magnitude / mean_magnitude) * 20))
+            # Calculate confidence based on signal quality
+            noise_level = np.std(hr_magnitudes)
+            signal_to_noise = peak_magnitude / (noise_level + 1e-10)
+            confidence = min(95, int(signal_to_noise * 10))
+            confidence = max(20, confidence)  # Minimum confidence
+            
+            # Determine signal quality
+            if confidence > 70:
+                quality = "excellent"
+            elif confidence > 50:
+                quality = "good"
+            elif confidence > 30:
+                quality = "fair"
+            else:
+                quality = "poor"
+            
+            logger.info(f"Heart rate: {heart_rate} BPM, confidence: {confidence}%, quality: {quality}")
+            logger.info(f"Peak freq: {peak_freq:.3f} Hz, S/N ratio: {signal_to_noise:.2f}")
             
             return {
                 "heart_rate": heart_rate,
                 "confidence": confidence,
-                "method": "fft_analysis",
+                "method": "improved_fft_analysis",
                 "peak_frequency": float(peak_freq),
-                "signal_quality": "good" if confidence > 50 else "poor"
+                "signal_quality": quality,
+                "signal_to_noise_ratio": float(signal_to_noise)
             }
             
         except Exception as e:
