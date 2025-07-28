@@ -385,6 +385,8 @@ class PPGProcessor:
         except Exception as e:
             logger.error(f"Error processing intensity value: {str(e)}")
             return {"status": "error", "error": str(e)}
+    
+    def process_frame(self, frame_data: str, timestamp: float) -> Dict[str, Any]:
         """Process a single frame and update signals"""
         try:
             if self.start_time is None:
