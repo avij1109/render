@@ -42,6 +42,11 @@ class PPGProcessor:
         self.hr_freq_range = (0.7, 4.0)  # 42-240 BPM
         self.resp_freq_range = (0.1, 0.5)  # 6-30 breaths per minute
         
+        # SMOOTHING: Moving average for stable heart rate
+        from collections import deque
+        self.hr_history = deque(maxlen=5)  # Last 5 heart rate readings
+        self.last_stable_hr = None
+        
     def reset(self):
         """Reset all signals for new measurement"""
         self.green_signal = []
@@ -50,6 +55,9 @@ class PPGProcessor:
         self.timestamps = []
         self.frame_count = 0
         self.start_time = None
+        # Reset smoothing history
+        self.hr_history.clear()
+        self.last_stable_hr = None
         logger.info("PPG processor reset")
     
     def extract_rgb_from_frame(self, frame_data: bytes) -> Dict[str, float]:
@@ -143,10 +151,10 @@ class PPGProcessor:
                                          distance=min_distance,
                                          prominence=prominence_threshold)
             
-            if len(peaks) < 2:
-                # Not enough peaks detected
-                logger.warning(f"Only {len(peaks)} peaks detected, need at least 2")
-                return {"heart_rate": 0, "confidence": 0, "method": "insufficient_peaks"}
+            # REQUIRE MINIMUM 5 PEAKS for stable measurement (ChatGPT suggestion)
+            if len(peaks) < 5:
+                logger.warning(f"Only {len(peaks)} peaks detected, need at least 5 for stable reading")
+                return {"heart_rate": 0, "confidence": 0, "method": "insufficient_peaks_for_stability"}
             
             # Calculate heart rate from time intervals between peaks
             peak_intervals = np.diff(peaks) / self.sampling_rate  # Convert to seconds
@@ -162,13 +170,51 @@ class PPGProcessor:
                 logger.warning(f"Heart rate {heart_rate:.1f} outside physiological range")
                 return {"heart_rate": 0, "confidence": 0, "method": "invalid_range"}
             
+            # SIGNAL QUALITY CHECK: Reject if too much noise
+            signal_variance = np.var(filtered_signal)
+            if signal_variance < 0.01:  # Too flat = poor signal
+                logger.warning(f"Poor signal quality, variance too low: {signal_variance:.4f}")
+                return {"heart_rate": 0, "confidence": 0, "method": "poor_signal_quality"}
+            
+            # SMOOTHING: Add to moving average window
+            self.hr_history.append(heart_rate)
+            
+            if len(self.hr_history) >= 3:  # Need at least 3 readings
+                # Calculate smoothed heart rate
+                smoothed_hr = sum(self.hr_history) / len(self.hr_history)
+                
+                # Check if current reading is too different from trend (outlier detection)
+                if len(self.hr_history) >= 4:
+                    recent_avg = sum(list(self.hr_history)[-3:]) / 3
+                    if abs(heart_rate - recent_avg) > 25:  # More than 25 BPM difference
+                        logger.warning(f"Outlier detected: {heart_rate:.1f} vs recent avg {recent_avg:.1f}")
+                        # Don't return this reading, use smoothed instead
+                        final_hr = smoothed_hr
+                    else:
+                        final_hr = smoothed_hr
+                else:
+                    final_hr = smoothed_hr
+            else:
+                # Not enough history yet, use raw reading but be cautious
+                final_hr = heart_rate
+                smoothed_hr = heart_rate
+            
             # Calculate confidence based on signal quality and regularity
             signal_to_noise = np.max(properties['prominences']) / (signal_std + 1e-10)
             regularity_score = max(0, 1 - interval_cv * 5)  # Lower CV = more regular
             
+            # Boost confidence if smoothed reading is stable
+            stability_bonus = 0
+            if len(self.hr_history) >= 4:
+                hr_std = np.std(list(self.hr_history))
+                if hr_std < 5:  # Very stable readings
+                    stability_bonus = 15
+                elif hr_std < 10:  # Moderately stable
+                    stability_bonus = 10
+            
             # Combined confidence score
-            confidence = min(95, int((signal_to_noise * 15 + regularity_score * 40 + 20)))
-            confidence = max(10, confidence)
+            confidence = min(95, int((signal_to_noise * 10 + regularity_score * 30 + 25 + stability_bonus)))
+            confidence = max(15, confidence)
             
             # Determine signal quality
             if confidence > 80:
@@ -180,23 +226,27 @@ class PPGProcessor:
             else:
                 quality = "poor"
             
-            # Return exact heart rate (not rounded to integer)
-            exact_heart_rate = round(heart_rate, 1)
+            # Return SMOOTHED heart rate for stability
+            exact_heart_rate = round(final_hr, 1)
+            self.last_stable_hr = exact_heart_rate
             
-            logger.info(f"EXACT Heart Rate: {exact_heart_rate} BPM")
+            logger.info(f"RAW HR: {heart_rate:.1f} BPM → SMOOTHED: {exact_heart_rate:.1f} BPM")
             logger.info(f"Detected {len(peaks)} peaks, avg interval: {avg_interval:.3f}s")
             logger.info(f"Confidence: {confidence}%, Quality: {quality}")
-            logger.info(f"Heart rate variability (CV): {interval_cv:.3f}")
+            logger.info(f"HR History: {[round(x, 1) for x in self.hr_history]}")
             
             return {
                 "heart_rate": exact_heart_rate,
+                "raw_heart_rate": round(heart_rate, 1),  # Also return raw for comparison
                 "confidence": confidence,
-                "method": "time_domain_peak_detection", 
+                "method": "smoothed_time_domain_peak_detection", 
                 "peaks_detected": len(peaks),
                 "avg_interval_seconds": float(avg_interval),
                 "heart_rate_variability": float(interval_cv),
                 "signal_quality": quality,
-                "signal_to_noise_ratio": float(signal_to_noise)
+                "signal_to_noise_ratio": float(signal_to_noise),
+                "hr_history_size": len(self.hr_history),
+                "signal_variance": float(signal_variance)
             }
             
         except Exception as e:
