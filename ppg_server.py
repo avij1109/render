@@ -491,33 +491,16 @@ async def websocket_endpoint(websocket: WebSocket):
                             "timestamp": time.time()
                         }
                     else:
-                        # Process the frame
+                        # Process the frame (BACK TO WORKING VERSION)
                         result = ppg_processor.process_frame(frame_data, timestamp)
                         response = {
                             "type": "result",
                             "data": result,
                             "timestamp": time.time()
                         }
-                
-                elif message_type == "intensity":
-                    # NEW: Handle green intensity values (sent ~1/second for ML/BP prediction)
-                    intensity = message.get("value", 0.0)
-                    timestamp = message.get("timestamp", time.time())
-                    
-                    if intensity <= 0:
-                        response = {
-                            "type": "error",
-                            "error": "Invalid intensity value",
-                            "timestamp": time.time()
-                        }
-                    else:
-                        # Process intensity for ML/BP prediction
-                        result = ppg_processor.process_intensity_value(intensity, timestamp)
-                        response = {
-                            "type": "ml_result",
-                            "data": result,
-                            "timestamp": time.time()
-                        }
+                        
+                        # Log frame processing for debugging
+                        logger.info(f"Processed frame {result.get('frame_count', 0)}, green: {result.get('green_signal_value', 0):.1f}")
                 
                 else:
                     response = {
