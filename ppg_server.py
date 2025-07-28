@@ -340,52 +340,6 @@ class PPGProcessor:
             logger.error(f"Error calculating SpO2: {str(e)}")
             return {"spo2": 0, "confidence": 0}
     
-    def process_intensity_value(self, intensity: float, timestamp: float) -> Dict[str, Any]:
-        """Process a single green intensity value (sent ~1/second for ML/BP prediction)"""
-        try:
-            if self.start_time is None:
-                self.start_time = timestamp
-            
-            # Add intensity to signal buffer for ML processing
-            self.green_signal.append(intensity)
-            self.timestamps.append(timestamp)
-            self.frame_count += 1
-            
-            # Maintain sliding window
-            if len(self.green_signal) > self.window_size:
-                self.green_signal.pop(0)
-                self.timestamps.pop(0)
-            
-            # Calculate vital signs if we have enough data
-            results = {
-                "status": "processing_intensity",
-                "frame_count": self.frame_count,
-                "elapsed_time": timestamp - self.start_time,
-                "intensity_value": intensity,
-                "buffer_size": len(self.green_signal)
-            }
-            
-            # Calculate heart rate for BP prediction (every 5 intensity values = ~5 seconds)
-            if len(self.green_signal) >= 30 and self.frame_count % 5 == 0:
-                hr_result = self.calculate_heart_rate(self.green_signal)
-                
-                # Future: Add BP prediction model here
-                # bp_prediction = self.predict_blood_pressure(self.green_signal, hr_result)
-                
-                results.update({
-                    "heart_rate": hr_result,
-                    "signal_processing": "ml_ready",
-                    # "bp_prediction": bp_prediction  # For future ML model
-                })
-                
-                logger.info(f"ML Processing: HR {hr_result.get('heart_rate', 0)} BPM from {len(self.green_signal)} intensity values")
-            
-            return results
-            
-        except Exception as e:
-            logger.error(f"Error processing intensity value: {str(e)}")
-            return {"status": "error", "error": str(e)}
-    
     def process_frame(self, frame_data: str, timestamp: float) -> Dict[str, Any]:
         """Process a single frame and update signals"""
         try:
@@ -491,16 +445,13 @@ async def websocket_endpoint(websocket: WebSocket):
                             "timestamp": time.time()
                         }
                     else:
-                        # Process the frame (BACK TO WORKING VERSION)
+                        # Process the frame
                         result = ppg_processor.process_frame(frame_data, timestamp)
                         response = {
                             "type": "result",
                             "data": result,
                             "timestamp": time.time()
                         }
-                        
-                        # Log frame processing for debugging
-                        logger.info(f"Processed frame {result.get('frame_count', 0)}, green: {result.get('green_signal_value', 0):.1f}")
                 
                 else:
                     response = {
